@@ -1,0 +1,17 @@
+# Hyperparameter Search Space
+grid_search:
+  spatial_size:
+    - [64, 64, 64]
+    - [128, 64, 64]
+    - [64, 128, 64]
+    - [64, 64, 128]
+  
+  batch_size:
+    - 64
+    - 32
+    - 16
+  
+  lr:
+    - 1.0e-3
+    - 5.0e-4
+    - 1.0e-4

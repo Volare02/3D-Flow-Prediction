@@ -1,131 +1,159 @@
 import h5py
-import random
-import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 class FlowDataset(Dataset):
-    def __init__(self, file_path, mode='train', spatial_crop_size = (32, 32, 32),
-                 variables = ['UX_ms-1', 'UY_ms-1', 'UZ_ms-1', 'P_Pa'], num_spatial_crops = 10): 
+    def __init__(self, 
+                 file_path, 
+                 mode='train', 
+                 spatial_size=(64, 64, 64), 
+                 val_ratio=0.2, 
+                 test_ratio=0.1, 
+                 dt_per_frame=0.05):
         """
-        Dataset for Variable Time-Step Prediction (Bidirectional).
-        
         Args:
-            file_path           (str)                   : Path to the HDF5 data file.
-            mode                (str)                   : String represents the mode.
-            spatial_crop_size   (Tuple[int, int, int])  : Dimensions (D, H, W) for spatial cropping.
-            variables           (List[str])             : List of flow variables to load.
-            num_spatial_crops   (int)                   : Number of deterministic spatial crops generated for each time pair.
+            file_path (str): Path to the HDF5 file.
+            mode (str): 'train', 'val', or 'test'.
+            spatial_size (tuple or int): Size of the spatial crop (D, H, W).
+            dt_per_frame (float): Physical time interval per frame (e.g., 0.05s).
         """
-        super().__init__()
-
         self.file_path = file_path
         self.mode = mode
-        self.spatial_crop_size = spatial_crop_size
-        self.variables = variables
-        self.num_spatial_crops = num_spatial_crops
+        self.dt_per_frame = dt_per_frame
         
-        # HDF5 file handle for worker-local lazy loading.
-        self.f = None 
+        # 1. Initialize file handle as None (Critical for Lazy Loading).
+        self.f = None
 
-        # Read Metadata.
-        with h5py.File(file_path, 'r') as f: 
-            sample_data = f["UX_ms-1/id_0000"][()]
-            self.nx, self.ny, self.nz = sample_data.shape
+        # Handle spatial_size input (convert int to tuple if necessary).
+        if isinstance(spatial_size, int):
+            self.crop_size = (spatial_size, spatial_size, spatial_size)
+        else:
+            self.crop_size = spatial_size
 
-            self.all_times = f["metadata/times"][:]
-            self.total_snapshots = len(self.all_times)
+        # ====================================================
+        # [CONFIG] Variable Names Mapping
+        # ====================================================
+        self.var_names = {
+            'u': 'UX_ms-1',
+            'v': 'UY_ms-1',
+            'w': 'UZ_ms-1',
+            'p': 'P_Pa'
+        }
 
-        # Full Pairing.
-        self.input_indices = list(range(0, self.total_snapshots)) 
-        self.dt_steps = list(range(1 - self.total_snapshots, self.total_snapshots)) 
-        self.valid_time_pairs = self._generate_valid_time_pairs()
+        self.samples = [] 
         
-        # Logging.
-        T = self.total_snapshots
-        print(f"FlowDataset initialized.")
-        print(f"    Total Snapshots: {T}")
-        print(f"    Total items    : {self.__len__()}")
+        # Open file ONCE just to build the index map, then close it immediately.
+        with h5py.File(file_path, 'r') as f:
+            # Check if variables exist.
+            for v_key in self.var_names.values():
+                if v_key not in f:
+                    print(f"Warning: Key '{v_key}' not found in HDF5.")
+            
+            # Retrieve Time Steps (IDs) from the Pressure group.
+            p_key = self.var_names['p']
+            all_time_keys = sorted(list(f[p_key].keys()))
+            total_frames = len(all_time_keys)
+            
+            # Split Dataset by Time (Sequential Split).
+            n_test = int(total_frames * test_ratio)
+            n_val = int(total_frames * val_ratio)
+            n_train = total_frames - n_test - n_val
+            
+            if mode == 'train':
+                self.time_ids = all_time_keys[:n_train]
+            elif mode == 'val':
+                self.time_ids = all_time_keys[n_train : n_train + n_val]
+            elif mode == 'test':
+                self.time_ids = all_time_keys[n_train + n_val:]
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
+            
+            print(f"[{mode.upper()}] Assigned {len(self.time_ids)} time frames.")
+            
+            # Generate All Samples (Grid Patches x Time Pairs).
+            self._index_all_pairs(f, self.time_ids)
+
+        print(f"[{mode.upper()}] Total samples generated: {len(self.samples)}")
+
+    def _index_all_pairs(self, f_handle, time_keys):
+        """
+        Generate metadata for all valid (t_i, t_j) pairs where j >= i.
+        """
+        # 1. Get Domain Dimensions.
+        first_id = time_keys[0]
+        p_key = self.var_names['p']
+        # Shape example: (1536, 384, 1024) -> (D, H, W).
+        full_shape = f_handle[p_key][first_id].shape
+        dim0, dim1, dim2 = full_shape
+        
+        cd, ch, cw = self.crop_size
+        
+        # 2. Define Spatial Grid (Non-overlapping -> Stride = Crop Size).
+        s0_starts = range(0, dim0 - cd + 1, cd)
+        s1_starts = range(0, dim1 - ch + 1, ch)
+        s2_starts = range(0, dim2 - cw + 1, cw)
+        
+        # 3. Nested Loop for Time Pairs.
+        num_times = len(time_keys)
+        
+        for i in range(num_times):
+            for j in range(i, num_times): # Constraint: j >= i.
+                t_curr = time_keys[i]
+                t_next = time_keys[j]
+                
+                # Calculate time difference index.
+                delta_idx = j - i 
+                
+                # Register all spatial crops for this time pair.
+                for s0 in s0_starts:
+                    for s1 in s1_starts:
+                        for s2 in s2_starts:
+                            self.samples.append({
+                                't_curr': t_curr,
+                                't_next': t_next,
+                                'delta_idx': delta_idx,
+                                's0': s0,
+                                's1': s1,
+                                's2': s2
+                            })
 
     def __len__(self):
-        """
-        Returns the total logical size of the dataset.
-        """
-        return len(self.valid_time_pairs) * self.num_spatial_crops
+        return len(self.samples)
 
-    def __getitem__(self, index):
-        """
-        Loads the input state, target state, and time metadata (dt).
-        """
-        # 1. Determine Time Pair Indices (i, j).
-        time_pair_index = index // self.num_spatial_crops 
-        input_index, output_index = self.valid_time_pairs[time_pair_index]
-        
-        # 2. Calculate Time Difference.
-        dt = self.all_times[output_index] - self.all_times[input_index]
-
-        # 3. Spatial Cropping Coordinates.
-        sx, sy, sz, dx, dy, dz = self._get_crop_coords_by_index(index)
-
-        # 4. Read Data (Lazy I/O).
-        f_handle = self._get_file_handle()
-        input_list, target_list = [], []   
-        for var in self.variables:
-            key_in = f"{var}/id_{input_index:04d}"
-            key_out = f"{var}/id_{output_index:04d}"
-            
-            input_data = f_handle[key_in][sx : sx + dx, sy : sy + dy, sz : sz + dz]
-            target_data = f_handle[key_out][sx : sx + dx, sy : sy + dy, sz : sz + dz]
-            
-            input_list.append(input_data)
-            target_list.append(target_data)
-
-        # 5. Convert and Return.
-        feats = torch.from_numpy(np.stack(input_list)).float()
-        labels = torch.from_numpy(np.stack(target_list)).float()
-        time_meta = torch.tensor(dt, dtype=torch.float32)
-        
-        return feats, labels, time_meta
-
-    def _get_file_handle(self):
-        """
-        Opens HDF5 file if not already open (Worker-local lazy initialization).
-        """
+    def __getitem__(self, idx):
         if self.f is None:
-            self.f = h5py.File(self.file_path, 'r')
+            # swmr=True allows reading even if the file is being written to (optional but robust)
+            self.f = h5py.File(self.file_path, 'r', swmr=True)
+
+        # 1. Retrieve Metadata.
+        meta = self.samples[idx]
+        s0, s1, s2 = meta['s0'], meta['s1'], meta['s2']
+        cd, ch, cw = self.crop_size
         
-        return self.f
+        # 2. Read Data using persistent self.f handle.
+        # NOTE: Do NOT close the file here, keep it open for the worker's lifetime.
+        def read_crop(var_name, time_id):
+            key = self.var_names[var_name]
+            # Use self.f to read the specific slice.
+            data = self.f[key][time_id][s0:s0+cd, s1:s1+ch, s2:s2+cw]
+            return torch.from_numpy(data).float()
 
-    def _generate_valid_time_pairs(self):
-        """
-        Generates a list of all valid (input_index, output_index) pairs.
-        """
-        valid_pairs = []
-        for input_index in self.input_indices: 
-            for dt_step in self.dt_steps:
-                output_index = input_index + dt_step
-                if (output_index >= 0) and (output_index < self.total_snapshots):
-                    valid_pairs.append((input_index, output_index))
-
-        return valid_pairs
-
-    def _get_crop_coords_by_index(self, index):
-        """
-        Generates deterministic spatial crop coordinates based on the index.
-        """
-        # Determine the unique ID for the time pair.
-        time_pair_id = index // self.num_spatial_crops
-
-        # Determine the specific crop ID.
-        crop_id = index % self.num_spatial_crops
-
-        # Use a seed for deterministic coordinate selection.
-        seed_val = time_pair_id * 1000 + crop_id + (0 if self.mode == 'train' else 10000) 
-        rng = random.Random(seed_val)
+        # Input State (t_i).
+        u_in = read_crop('u', meta['t_curr'])
+        v_in = read_crop('v', meta['t_curr'])
+        w_in = read_crop('w', meta['t_curr'])
+        p_in = read_crop('p', meta['t_curr'])
+        inputs = torch.stack([u_in, v_in, w_in, p_in], dim=0)
         
-        crop_x, crop_y, crop_z = self.spatial_crop_size
-        start_x = rng.randint(0, self.nx - crop_x)
-        start_y = rng.randint(0, self.ny - crop_y)
-        start_z = rng.randint(0, self.nz - crop_z)
+        # Target State (t_j).
+        u_tar = read_crop('u', meta['t_next'])
+        v_tar = read_crop('v', meta['t_next'])
+        w_tar = read_crop('w', meta['t_next'])
+        p_tar = read_crop('p', meta['t_next'])
+        targets = torch.stack([u_tar, v_tar, w_tar, p_tar], dim=0)
 
-        return start_x, start_y, start_z, crop_x, crop_y, crop_z
+        # 3. Calculate Physical Time Delta (dt).
+        dt_val = meta['delta_idx'] * self.dt_per_frame
+        dt_tensor = torch.tensor([dt_val], dtype=torch.float32)
+        
+        return inputs, targets, dt_tensor
