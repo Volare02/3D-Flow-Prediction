@@ -1,5 +1,6 @@
 import os
 import csv
+import sys
 import argparse
 import torch
 import torch.nn as nn
@@ -7,7 +8,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# 假设 src 文件夹在当前目录
 from src.dataset import FlowDataset
 from src.models import HybridUNet
 
@@ -21,8 +21,8 @@ DEFAULT_CONFIG = {
     "log_dir": "./logs",
     
     # Hyperparameters.
-    "batch_size": 16,
-    "learning_rate": 1e-4,
+    "batch_size": 32,
+    "learning_rate": 5e-4,
     "num_epochs": 50,
     "num_workers": 8,
     "spatial_crop_size": (64, 64, 64),
@@ -52,15 +52,21 @@ def parse_args():
 def train(config):
     # Setup device.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Starting Experiment: {config['experiment_name']}")
-    print(f"   Device: {device}")
-    print(f"   Config: Size={config['spatial_crop_size']}, BS={config['batch_size']}, LR={config['learning_rate']}")
+    is_cuda = device.type == 'cuda' # Check once if we are on CUDA
+    
+    print(f"Starting Experiment: {config['experiment_name']}")
+    print(f"    Device: {device}")
+    print(f"    Config: Size={config['spatial_crop_size']}, BS={config['batch_size']}, LR={config['learning_rate']}")
+    
+    # 2. Determine if running in an interactive environment (for tqdm control).
+    DISABLE_TQDM = not sys.stdout.isatty()
     
     # Create Directories.
     os.makedirs(config["checkpoint_dir"], exist_ok=True)
     os.makedirs(config["log_dir"], exist_ok=True)
     
     # Initialize CSV Logger.
+    # Note: Using fixed filename here, ensuring log_dir is unique is handled outside (e.g., in grid search script).
     log_csv_path = os.path.join(config["log_dir"], "training_log.csv")
     with open(log_csv_path, mode='w', newline='') as f:
         writer = csv.writer(f)
@@ -107,14 +113,19 @@ def train(config):
     
     # 4. Loss & Scaler.
     criterion = nn.MSELoss()
-    scaler = torch.amp.GradScaler()
+    # Initialize GradScaler and enable it only if CUDA is available
+    scaler = torch.amp.GradScaler(enabled=is_cuda) 
 
     # ========== Training Loop ==========
     best_val_loss = float("inf")
     
     for epoch in range(config["num_epochs"]):
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']}", mininterval=10)
+        # Apply the tqdm disable fix.
+        pbar = tqdm(train_loader, 
+                    desc=f"Epoch {epoch+1}/{config['num_epochs']}", 
+                    mininterval=10, 
+                    disable=DISABLE_TQDM)
         
         train_loss_sum = 0.0
         for inputs, targets, dt in pbar:
@@ -123,13 +134,11 @@ def train(config):
             dt = dt.to(device, non_blocking=True)
             
             optimizer.zero_grad()
-            
-            with torch.amp.autocast():
+            with torch.amp.autocast(device_type=device.type, enabled=is_cuda):
                 preds = model(inputs, dt)
                 loss = criterion(preds, targets)
 
             scaler.scale(loss).backward()
-            
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
@@ -137,7 +146,8 @@ def train(config):
             scaler.update()
             
             train_loss_sum += loss.item()
-            pbar.set_postfix({"MSE": f"{loss.item():.6f}"})
+            if not DISABLE_TQDM:
+                pbar.set_postfix({"MSE": f"{loss.item():.6f}"})
 
         avg_train_loss = train_loss_sum / len(train_loader)
 
@@ -150,7 +160,8 @@ def train(config):
                 targets = targets.to(device, non_blocking=True)
                 dt = dt.to(device, non_blocking=True)
                 
-                with torch.amp.autocast():
+                # AMP Fix (Validation).
+                with torch.amp.autocast(device_type=device.type, enabled=is_cuda):
                     preds = model(inputs, dt)
                     loss = criterion(preds, targets)
                 
@@ -161,26 +172,32 @@ def train(config):
         scheduler.step()
 
         # ========== LOGGING ==========
-        print(f"   [Summary] Train MSE: {avg_train_loss:.6f} | Val MSE: {avg_val_loss:.6f}")
+        print(f"    [Summary] Train MSE: {avg_train_loss:.6f} | Val MSE: {avg_val_loss:.6f} | LR: {current_lr:.2e}")
 
         with open(log_csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([epoch + 1, avg_train_loss, avg_val_loss, current_lr])
 
         # Save Checkpoints.
-        # 1. Best Model
+        # 1. Best Model.
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             save_path = os.path.join(config["checkpoint_dir"], "best_model.pth")
             torch.save(model.state_dict(), save_path)
             
-        # 2. Latest Model
+        # 2. Latest Model.
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': avg_train_loss,
         }, os.path.join(config["checkpoint_dir"], "latest.pth"))
+    
+    # Final cache cleanup to prevent memory leaks after script completion.
+    if is_cuda:
+        print("Finalizing training. Emptying CUDA cache...")
+        torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     config = DEFAULT_CONFIG.copy()
@@ -192,7 +209,7 @@ if __name__ == "__main__":
         
     if args.save_dir:
         config["checkpoint_dir"] = args.save_dir
-        config["log_dir"] = os.path.join(args.save_dir, "logs")
+        config["log_dir"] = args.save_dir 
         config["experiment_name"] = os.path.basename(args.save_dir)
         
     if args.crop_size:
